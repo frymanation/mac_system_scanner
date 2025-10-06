@@ -89,6 +89,9 @@ class ScannerGUI(tk.Tk):
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="Reveal in Finder", command=self.on_open_selected)
         self.menu.add_command(label="Copy Path", command=self.on_copy_path)
+
+        self.menu.add_separator()
+        self.menu.add_command(label="Scan This Folder Only", command=self.on_scan_selected_only)
         self.tree.bind("<Button-2>", self.show_context_menu)   # middle-click
         self.tree.bind("<Button-3>", self.show_context_menu)   # right-click
         self.tree.bind("<Control-Button-1>", self.show_context_menu)  # ctrl-click
@@ -187,6 +190,28 @@ class ScannerGUI(tk.Tk):
         self.update()
         self.status.configure(text=f"Copied to clipboard: {path}")
 
+    def on_scan_selected_only(self):
+        """Right-click action: scan only the selected row's path with current Advanced settings."""
+        path = self._get_selected_path()
+        if not path:
+            return
+
+        try:
+            depth = int(getattr(self, "depth_var", tk.IntVar(value=DEF_DEPTH)).get())
+            min_gb = float(getattr(self, "min_gb_var", tk.DoubleVar(value=DEF_MIN_GB)).get())
+            topn = int(getattr(self, "top_var", tk.IntVar(value=DEF_TOP)).get())
+            leaf = bool(getattr(self, "leaf_only_var", tk.BooleanVar(value=DEF_LEAF_ONLY)).get())
+            include_files = bool(getattr(self, "files_var", tk.BooleanVar(value=DEF_FILES)).get())
+            charts = bool(getattr(self, "charts_var", tk.BooleanVar(value=DEF_CHARTS)).get())
+            min_file_gb = float(getattr(self, "min_file_gb_var", tk.DoubleVar(value=DEF_MIN_FILE_GB)).get())
+            filetype_min_mb = int(getattr(self, "filetype_min_mb_var", tk.IntVar(value=DEF_FILETYPE_MIN_MB)).get())
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid settings: {e}")
+            return
+
+        # Launch scan using ONLY the selected path as root
+        self._launch_scan([path], depth, min_gb, topn, leaf, include_files, charts, min_file_gb, filetype_min_mb)
+
     # ---------- UI helpers ----------
     def toggle_advanced(self):
         if self.adv_visible:
@@ -261,6 +286,24 @@ class ScannerGUI(tk.Tk):
         m, r = divmod(r, 60)
         return f"{h:d}:{m:02d}:{r:02d}" if h else f"{m:d}:{r:02d}"
 
+    def _compute_total_steps(self, num_roots, include_files, charts):
+        """Plan total steps for %/ETA: (du + files? + sample?) × roots."""
+        return num_roots * (1 + (1 if include_files else 0) + (1 if charts else 0))
+
+    def _launch_scan(self, roots, depth, min_gb, topn, leaf, include_files, charts, min_file_gb, filetype_min_mb):
+        """Common launcher used by on_run and on_scan_selected_only."""
+        # reset UI
+        self.tree.delete(*self.tree.get_children())
+        self.status.configure(text="Scanning…")
+        self.set_busy(True)
+
+        total_steps = self._compute_total_steps(len(roots), include_files, charts)
+        self._progress_reset(total_steps)
+
+        args = (roots, depth, min_gb, topn, leaf, include_files, charts, min_file_gb, filetype_min_mb)
+        self._scan_thread = threading.Thread(target=self._run_scan, args=args, daemon=True)
+        self._scan_thread.start()
+        self.after(200, self._poll_thread)
     # ---------- Scan orchestration ----------
     def on_run(self):
         if self._scan_thread and self._scan_thread.is_alive():
@@ -270,6 +313,7 @@ class ScannerGUI(tk.Tk):
             if not roots:
                 messagebox.showerror("Error", "Please specify at least one root directory.")
                 return
+
             depth = int(getattr(self, "depth_var", tk.IntVar(value=DEF_DEPTH)).get())
             min_gb = float(getattr(self, "min_gb_var", tk.DoubleVar(value=DEF_MIN_GB)).get())
             topn = int(getattr(self, "top_var", tk.IntVar(value=DEF_TOP)).get())
@@ -282,23 +326,7 @@ class ScannerGUI(tk.Tk):
             messagebox.showerror("Error", f"Invalid settings: {e}")
             return
 
-        self.tree.delete(*self.tree.get_children())
-        self.status.configure(text="Scanning…")
-        self.set_busy(True)
-
-        # Progress planning:
-        #   per root we have phases:
-        #     1) du folders
-        #     2) top files (optional)
-        #     3) file-type sampling (optional, only if charts)
-        phases_per_root = 1 + (1 if include_files else 0) + (1 if charts else 0)
-        total_steps = len(roots) * phases_per_root
-        self._progress_reset(total_steps)
-
-        args = (roots, depth, min_gb, topn, leaf, include_files, charts, min_file_gb, filetype_min_mb)
-        self._scan_thread = threading.Thread(target=self._run_scan, args=args, daemon=True)
-        self._scan_thread.start()
-        self.after(200, self._poll_thread)
+        self._launch_scan(roots, depth, min_gb, topn, leaf, include_files, charts, min_file_gb, filetype_min_mb)
 
     def _poll_thread(self):
         if self._scan_thread and self._scan_thread.is_alive():
