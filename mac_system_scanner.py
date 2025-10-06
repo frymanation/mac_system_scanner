@@ -6,6 +6,9 @@ Enhanced version with:
   ✅ Largest file detection
   ✅ Leaf-only deduplication (no duplicate parent rows)
   ✅ Rich progress bar + styled output
+
+Run in terminal with this syntax:
+    python3 mac_system_scanner.py --depth 3 --top 40 --min-gb 0.5 --leaf-only --files --min-file-gb 1
 """
 
 import argparse
