@@ -16,7 +16,8 @@ from rich.table import Table
 console = Console()
 HOME = Path.home()
 DEFAULT_ROOTS = ["/Library", "/private", "/System", str(HOME), str(HOME / "Library")]
-REPORT_PATH = HOME / "Desktop/SystemDataReport_Deep.txt"
+today = datetime.now().strftime("%Y-%m-%d %H:%M")
+REPORT_PATH = HOME / f"Desktop/SystemDataReport_Deep_{today}.txt"
 
 
 def run(cmd):
@@ -100,25 +101,25 @@ def main():
     lines.append("")
 
     table = Table(title="macOS Deep Storage Report", header_style="bold magenta")
-    table.add_column("Size (GB)", justify="right")
-    table.add_column("Path", justify="left")
+    table.add_column(header="Size (GB)", justify="right")
+    table.add_column(header="Path", justify="left")
 
     for root in track(args.roots, description="🔍 Scanning directories..."):
-        pairs = du_list(root, args.depth)
+        pairs = du_list(dir_path=root, depth=args.depth)
         pairs = [p for p in pairs if human_gb(p[0]) >= args.min_gb]
         if args.leaf_only:
-            pairs = leaf_only(pairs)
+            pairs = leaf_only(entries=pairs)
         pairs = sorted(pairs, key=lambda x: x[0], reverse=True)[:args.top]
 
         if pairs:
             for size_bytes, path in pairs:
-                gb = human_gb(size_bytes)
+                gb = human_gb(bytes_val=size_bytes)
                 color = "red" if gb > 10 else "yellow"
                 table.add_row(f"[{color}]{gb:6.2f}[/{color}]", path)
                 lines.append(f"{gb:6.2f}G\t{path}")
 
         if args.files:
-            big_files = find_big_files(root, args.min_file_gb, args.top)
+            big_files = find_big_files(root=root, min_gb=args.min_file_gb, top=args.top)
             for size_bytes, path in big_files:
                 gb = human_gb(size_bytes)
                 color = "cyan"
