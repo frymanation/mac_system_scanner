@@ -1,10 +1,17 @@
 """
-gui_mac_system_scanner.py — Simple Tkinter GUI for mac storage scanner
-Defaults match your usual CLI run, with a one-click Quick Scan.
-Requires: storage_utils.py in the same folder.
+gui_mac_system_scanner.py — macOS Storage Scanner GUI
+Adds:
+  • Real progress % with ETA (per root & per-phase)
+  • Double-click to open selected path in Finder
+  • Right-click context menu: Reveal in Finder, Copy Path
+Defaults match your usual CLI run; Advanced is collapsible.
+
+Requires: storage_utils.py in same folder.
 """
 
 import threading
+import time
+import subprocess
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -20,7 +27,7 @@ HOME = Path.home()
 DEFAULT_ROOTS = ["/Library", "/private", "/System", str(HOME), str(HOME / "Library")]
 REPORT_PATH = HOME / "Desktop/SystemDataReport_Deep.txt"
 
-# Default params (match your typical run)
+# Default params (your usual run)
 DEF_DEPTH = 3
 DEF_TOP = 40
 DEF_MIN_GB = 0.5
@@ -35,7 +42,7 @@ class ScannerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("macOS Storage Scanner")
-        self.geometry("980x640")
+        self.geometry("980x660")
         self.minsize(900, 560)
 
         # ===== Header + Quick Scan =====
@@ -48,7 +55,7 @@ class ScannerGUI(tk.Tk):
         # Enter key runs scan
         self.bind("<Return>", lambda e: self.on_run())
 
-        # ===== Minimal essentials (pre-filled defaults) =====
+        # ===== Minimal essentials (defaults prefilled) =====
         essentials = ttk.Frame(self, padding=(10, 4, 10, 6))
         essentials.pack(fill="x")
 
@@ -57,11 +64,13 @@ class ScannerGUI(tk.Tk):
         ttk.Entry(essentials, textvariable=self.roots_var, width=90).grid(row=0, column=1, sticky="we", padx=(8, 0))
         ttk.Button(essentials, text="Add…", command=self.add_root).grid(row=0, column=2, padx=(8, 0))
 
-        # Progress
+        # Progress row (now: real % + ETA)
         runfrm = ttk.Frame(self, padding=(10, 0, 10, 8))
         runfrm.pack(fill="x")
         self.progress = ttk.Progressbar(runfrm, mode="determinate", maximum=100)
         self.progress.pack(side="left", fill="x", expand=True)
+        self.progress_label = ttk.Label(runfrm, text="0% • ETA —:—")
+        self.progress_label.pack(side="left", padx=8)
 
         # ===== Results table =====
         columns = ("size_gb", "path", "kind")
@@ -73,6 +82,16 @@ class ScannerGUI(tk.Tk):
         self.tree.column("path", width=720, anchor="w")
         self.tree.column("kind", width=90, anchor="center")
         self.tree.pack(fill="both", expand=True, padx=10, pady=6)
+
+        # Open-in-Finder on double-click
+        self.tree.bind("<Double-1>", self.on_open_selected)
+        # Context menu (right-click or ctrl-click)
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="Reveal in Finder", command=self.on_open_selected)
+        self.menu.add_command(label="Copy Path", command=self.on_copy_path)
+        self.tree.bind("<Button-2>", self.show_context_menu)   # middle-click
+        self.tree.bind("<Button-3>", self.show_context_menu)   # right-click
+        self.tree.bind("<Control-Button-1>", self.show_context_menu)  # ctrl-click
 
         # Status
         self.status = ttk.Label(self, text="Ready (defaults preloaded). Press Enter or 'Run Quick Scan'.", anchor="w")
@@ -86,7 +105,6 @@ class ScannerGUI(tk.Tk):
         self.adv_btn.pack(side="left")
 
         self.adv = ttk.Frame(self, padding=(10, 0, 10, 10))
-        # Controls inside advanced:
         r = 0
         ttk.Label(self.adv, text="Depth:").grid(row=r, column=0, sticky="w")
         self.depth_var = tk.IntVar(value=DEF_DEPTH)
@@ -116,8 +134,11 @@ class ScannerGUI(tk.Tk):
         self.filetype_min_mb_var = tk.IntVar(value=DEF_FILETYPE_MIN_MB)
         ttk.Spinbox(self.adv, from_=1, to=5000, textvariable=self.filetype_min_mb_var, width=8).grid(row=r, column=7, sticky="w", padx=(8, 0), pady=(8, 0))
 
-        # Thread holder
+        # Thread + progress accounting
         self._scan_thread = None
+        self._start_time = None
+        self._total_steps = 0
+        self._done_steps = 0
 
         # mac-ish look
         try:
@@ -126,6 +147,45 @@ class ScannerGUI(tk.Tk):
             s.configure("Accent.TButton", font=("SF Pro", 12, "bold"))
         except Exception:
             pass
+
+    # ---------- Context menu / open ----------
+    def show_context_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if row:
+            self.tree.selection_set(row)
+            try:
+                self.menu.tk_popup(event.x_root, event.y_root)  # show menu
+            finally:
+                self.menu.grab_release()
+
+    def _get_selected_path(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        vals = self.tree.item(sel[0], "values")
+        # values: (size_gb, path, kind)
+        if len(vals) >= 2:
+            return vals[1]
+        return None
+
+    def on_open_selected(self, event=None):
+        path = self._get_selected_path()
+        if not path:
+            return
+        try:
+            # 'open' reveals file or folder in Finder (for files: opens; for dirs: opens)
+            subprocess.run(["open", path], check=False)
+        except Exception as e:
+            messagebox.showerror("Open in Finder", f"Could not open:\n{path}\n\n{e}")
+
+    def on_copy_path(self):
+        path = self._get_selected_path()
+        if not path:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self.update()
+        self.status.configure(text=f"Copied to clipboard: {path}")
 
     # ---------- UI helpers ----------
     def toggle_advanced(self):
@@ -166,6 +226,41 @@ class ScannerGUI(tk.Tk):
         for idx, (_, iid) in enumerate(items):
             self.tree.move(iid, "", idx)
 
+    # ---------- Progress helpers ----------
+    def _progress_reset(self, total_steps):
+        self._total_steps = max(1, int(total_steps))
+        self._done_steps = 0
+        self._start_time = time.time()
+        self._update_progress_label()
+
+    def _progress_step(self, steps=1):
+        self._done_steps += steps
+        if self._done_steps > self._total_steps:
+            self._done_steps = self._total_steps
+        pct = int((self._done_steps / self._total_steps) * 100)
+        self.after(0, lambda: self.progress.configure(maximum=100, value=pct))
+        self._update_progress_label()
+
+    def _update_progress_label(self):
+        # ETA based on average pace so far
+        now = time.time()
+        elapsed = max(0.001, now - (self._start_time or now))
+        ratio = self._done_steps / max(1, self._total_steps)
+        if ratio > 0:
+            remaining = elapsed * (1 - ratio) / ratio
+        else:
+            remaining = 0
+        eta_str = self._fmt_seconds(remaining)
+        pct = int((self._done_steps / max(1, self._total_steps)) * 100)
+        self.after(0, lambda: self.progress_label.configure(text=f"{pct}% • ETA {eta_str}"))
+
+    @staticmethod
+    def _fmt_seconds(s):
+        s = int(s)
+        h, r = divmod(s, 3600)
+        m, r = divmod(r, 60)
+        return f"{h:d}:{m:02d}:{r:02d}" if h else f"{m:d}:{r:02d}"
+
     # ---------- Scan orchestration ----------
     def on_run(self):
         if self._scan_thread and self._scan_thread.is_alive():
@@ -175,7 +270,6 @@ class ScannerGUI(tk.Tk):
             if not roots:
                 messagebox.showerror("Error", "Please specify at least one root directory.")
                 return
-            # Pull from advanced vars (they are already defaulted)
             depth = int(getattr(self, "depth_var", tk.IntVar(value=DEF_DEPTH)).get())
             min_gb = float(getattr(self, "min_gb_var", tk.DoubleVar(value=DEF_MIN_GB)).get())
             topn = int(getattr(self, "top_var", tk.IntVar(value=DEF_TOP)).get())
@@ -189,20 +283,26 @@ class ScannerGUI(tk.Tk):
             return
 
         self.tree.delete(*self.tree.get_children())
-        self.progress["value"] = 0
         self.status.configure(text="Scanning…")
         self.set_busy(True)
+
+        # Progress planning:
+        #   per root we have phases:
+        #     1) du folders
+        #     2) top files (optional)
+        #     3) file-type sampling (optional, only if charts)
+        phases_per_root = 1 + (1 if include_files else 0) + (1 if charts else 0)
+        total_steps = len(roots) * phases_per_root
+        self._progress_reset(total_steps)
 
         args = (roots, depth, min_gb, topn, leaf, include_files, charts, min_file_gb, filetype_min_mb)
         self._scan_thread = threading.Thread(target=self._run_scan, args=args, daemon=True)
         self._scan_thread.start()
-        self.after(150, self._poll_thread)
+        self.after(200, self._poll_thread)
 
     def _poll_thread(self):
         if self._scan_thread and self._scan_thread.is_alive():
-            # simple pulse
-            self.progress["value"] = (self.progress["value"] + 3) % 100
-            self.after(150, self._poll_thread)
+            self.after(250, self._poll_thread)
         else:
             self.set_busy(False)
 
@@ -224,7 +324,8 @@ class ScannerGUI(tk.Tk):
         sampled_for_types = []
 
         try:
-            for idx, root in enumerate(roots, start=1):
+            for root in roots:
+                # === Phase 1: directories (du) ===
                 lines.append(f"\n### Root: {root}")
                 pairs = du_list(root, depth)
                 per_root_pairs[root] = pairs[:]
@@ -245,6 +346,9 @@ class ScannerGUI(tk.Tk):
                         lines.append(f"{gb:6.2f}G\t{path}")
                         self.tree_insert_safe(f"{gb:6.2f}", path, "folder")
 
+                self._progress_step(1)  # done phase
+
+                # === Phase 2: files (optional) ===
                 if include_files:
                     big_files = find_big_files(root, min_file_gb, topn)
                     if big_files:
@@ -256,11 +360,12 @@ class ScannerGUI(tk.Tk):
                             self.tree_insert_safe(f"{gb:6.2f}", path, "file")
                     else:
                         lines.append("  (no files above threshold)")
+                    self._progress_step(1)
 
+                # === Phase 3: sampling for charts (optional) ===
                 if charts:
                     sampled_for_types.extend(sample_files_for_types(root, filetype_min_mb))
-
-                self.progress_step_safe(int(100 * idx / max(1, len(roots))))
+                    self._progress_step(1)
 
             # write report
             report_path.write_text("\n".join(lines))
@@ -295,6 +400,8 @@ class ScannerGUI(tk.Tk):
                     save_pie_chart("Storage by File Type (extensions)", labels, values, desktop / "Storage_ByFileType.png")
 
             self.set_status_safe(f"Done. Report saved to: {REPORT_PATH}")
+            # finalize progress
+            self._progress_step(0)  # refresh label one last time
         except Exception as e:
             self.set_status_safe(f"Error: {e}")
             messagebox.showerror("Error", str(e))
@@ -302,9 +409,6 @@ class ScannerGUI(tk.Tk):
     # thread-safe UI updates
     def tree_insert_safe(self, size_gb, path, kind):
         self.after(0, lambda: self.tree.insert("", "end", values=(size_gb, path, kind)))
-
-    def progress_step_safe(self, value):
-        self.after(0, lambda: self.progress.configure(value=value))
 
     def set_status_safe(self, text):
         self.after(0, lambda: self.status.configure(text=text))
