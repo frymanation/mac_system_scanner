@@ -1,183 +1,154 @@
 """
-Mac System Data Scanner — macOS Storage Analyzer
-------------------------------------------------
-Author: Jonathon Fryman
-Purpose:
-    Quickly identify which folders on macOS are consuming the most disk space
-    (especially within "System Data") and suggest safe cleanup targets.
-
-Features:
-    • Scans key system & user directories: /Library, /private, /System, /Users, ~/Library
-    • Uses native 'du' command for accurate folder sizes
-    • Displays results in a colorized table (via 'rich' library)
-    • Suggests cleanup actions for known safe-to-clear folders (Caches, Logs, Updates)
-    • Saves a detailed report to the Desktop
-    • Works safely with System Integrity Protection (SIP) enabled
-
-Dependencies:
-    pip install rich
-
-Usage:
-    python3 system_data_scanner_pro.py
-
-Output:
-    A colorful terminal summary and a report file saved to:
-        ~/Desktop/SystemDataReport_Pro.txt
+mac_system_scanner.py — Deep macOS Storage Analyzer (with Progress Bar)
+-----------------------------------------------------------------------
+Enhanced version with:
+  ✅ Multi-level folder scanning (depth configurable)
+  ✅ Largest file detection
+  ✅ Leaf-only deduplication (no duplicate parent rows)
+  ✅ Rich progress bar + styled output
 """
 
+import argparse
 import os
 import subprocess
-import sys
 from pathlib import Path
 from datetime import datetime
 from rich.console import Console
-from rich.table import Table
 from rich.progress import track
 
-# === CONFIGURATION ===
-
-# Initialize console for styled terminal output
+# === Configuration ===
 console = Console()
-
-# Define home and output report path
 HOME = Path.home()
-REPORT_PATH = HOME / "Desktop/SystemDataReport_Pro.txt"
-
-# Directories to check (system-level and user-level)
-TARGET_DIRS = [
-    "/Library",              # macOS-wide Application Support, Logs, Caches
-    "/private",              # Temp files, system logs, Time Machine local snapshots
-    "/System",               # macOS system frameworks and updates
-    "/Users",                # All user folders (can be huge)
-    str(HOME / "Library")    # Current user Library (per-user caches, support, backups)
+DEFAULT_ROOTS = [
+    "/Library",
+    "/private",
+    "/System",
+    str(HOME),
+    str(HOME / "Library"),
 ]
-
-# Minimum size (in GB) to display in the report
-THRESHOLD_GB = 1.0
+REPORT_PATH = HOME / "Desktop/SystemDataReport_Deep.txt"
 
 
-# === CORE FUNCTIONS ===
-
-def get_dir_size(dir_path: str):
-    """
-    Executes the native 'du' (disk usage) command to get the size of each folder
-    inside a given directory, limited to one level deep (-d1).
-
-    Args:
-        dir_path (str): Path to scan (must be an existing directory).
-
-    Returns:
-        list[str]: Each line from the 'du' output, containing size and folder path.
-
-    Notes:
-        - Uses '-x' flag to avoid crossing filesystem boundaries.
-        - Uses '-h' for human-readable sizes (e.g., 1.2G, 500M).
-        - stderr is silenced to avoid spam from SIP-protected directories.
-    """
-    try:
-        result = subprocess.run(
-            ["du", "-hxd1", dir_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # Ignore permission-denied errors
-            text=True,
-            check=False
-        )
-        return result.stdout.splitlines()
-    except Exception as e:
-        return [f"Error scanning {dir_path}: {e}"]
+# === Utility Functions ===
+def run(cmd: list[str]) -> str:
+    """Execute a shell command and return stdout."""
+    return subprocess.run(
+        cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
+    ).stdout
 
 
-def parse_sizes(lines: list[str]):
-    """
-    Parses raw 'du' output lines, filtering for folders measured in gigabytes (G).
-
-    Args:
-        lines (list[str]): Raw lines from the 'du' command.
-
-    Returns:
-        list[tuple[float, str]]: Sorted list of (size_gb, folder_path), descending.
-    """
-    data = []
-    for line in lines:
-        parts = line.split("\t")
-        if len(parts) == 2:
-            size, folder = parts
-            if "G" in size:
-                try:
-                    # Convert "1.5G" -> 1.5
-                    value = float(size.replace("G", "").strip())
-                    data.append((value, folder))
-                except ValueError:
-                    pass
-    return sorted(data, reverse=True)
+def du_list(dir_path: str, depth: int) -> list[tuple[int, str]]:
+    """Recursively gather folder sizes up to a given depth using 'du'."""
+    out = run(["du", "-kxd" + str(depth), dir_path])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            kib = int(parts[0])
+        except ValueError:
+            continue
+        rows.append((kib * 1024, parts[1]))  # bytes
+    return rows
 
 
-def suggest_cleanup(path: str) -> str:
-    """
-    Returns a short cleanup suggestion based on common folder name patterns.
-
-    Args:
-        path (str): Full folder path to analyze.
-
-    Returns:
-        str: Suggestion string (or empty string if no advice).
-    """
-    name = os.path.basename(path)
-    if "Cache" in name or "Caches" in name:
-        return "🧹 likely safe to delete (cache)"
-    if "Log" in name:
-        return "🧾 can usually delete old logs"
-    if "Update" in name or "Updates" in name:
-        return "⚙️ leftover macOS or app updates"
-    if "MobileSync" in path:
-        return "📱 old iPhone/iPad backups"
-    if "DerivedData" in path:
-        return "🧠 Xcode build cache (safe to clear)"
-    return ""
+def human_gb(bytes_val: int) -> float:
+    """Convert bytes to gigabytes."""
+    return bytes_val / (1024**3)
 
 
+def leaf_only(entries: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Keep only leaf-level paths (no duplicate parent rows)."""
+    keep = []
+    for size, path in sorted(entries, key=lambda x: len(x[1]), reverse=True):
+        is_parent = any(kp.startswith(path.rstrip("/") + "/") for _, kp in keep)
+        if not is_parent:
+            keep.append((size, path))
+    return sorted(keep, key=lambda x: x[0], reverse=True)
+
+
+def find_big_files(root: str, min_gb: float, top: int) -> list[tuple[int, str]]:
+    """Find the largest files above a certain threshold."""
+    out = run(["find", root, "-type", "f", "-size", f"+{min_gb}G"])
+    files = [line for line in out.splitlines() if line.strip()]
+    entries = []
+
+    if not files:
+        return entries
+
+    chunk = 200
+    for i in range(0, len(files), chunk):
+        group = files[i:i + chunk]
+        cmd = ["stat", "-f", "%z %N"] + group
+        for line in run(cmd).splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                size = int(parts[0])
+            except ValueError:
+                continue
+            entries.append((size, parts[1]))
+
+    return sorted(entries, key=lambda x: x[0], reverse=True)[:top]
+
+
+# === Main ===
 def main():
-    """
-    Main entry point for the program.
-    - Scans each target directory.
-    - Filters results to only those >= THRESHOLD_GB.
-    - Displays them in a rich colorized table.
-    - Writes a complete text report to the Desktop.
-    """
-    console.print("[bold cyan]🔍 macOS System Data Scanner Pro[/bold cyan]")
-    report = open(REPORT_PATH, "w")
-    report.write(f"=== macOS System Data Report — {datetime.now()} ===\n\n")
+    parser = argparse.ArgumentParser(description="Deep macOS storage analyzer with progress bar.")
+    parser.add_argument("--roots", nargs="*", default=DEFAULT_ROOTS, help="Directories to scan.")
+    parser.add_argument("--depth", type=int, default=3, help="Folder depth for du (default 3).")
+    parser.add_argument("--top", type=int, default=30, help="Top N results per root (default 30).")
+    parser.add_argument("--min-gb", type=float, default=0.5, help="Min folder size (GB).")
+    parser.add_argument("--leaf-only", action="store_true", help="Show only leaf folders.")
+    parser.add_argument("--files", action="store_true", help="Also show largest individual files.")
+    parser.add_argument("--min-file-gb", type=float, default=1.0, help="Min file size (GB).")
+    parser.add_argument("--report", default=str(REPORT_PATH), help="Report save path.")
+    args = parser.parse_args()
 
-    # Create the results table
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Size (GB)", justify="right")
-    table.add_column("Folder Path", justify="left")
-    table.add_column("Suggestion", justify="left")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    report_path = Path(args.report)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Iterate over target directories with progress bar
-    for dir_path in track(TARGET_DIRS, description="Scanning directories..."):
-        lines = get_dir_size(dir_path)
-        data = parse_sizes(lines)
-        for size, folder in data:
-            if size >= THRESHOLD_GB:
-                note = suggest_cleanup(folder)
-                color = "red" if size > 10 else "yellow"
-                table.add_row(f"[{color}]{size:.1f}[/{color}]", folder, note)
-                report.write(f"{size:.2f}G\t{folder}\t{note}\n")
+    lines = [
+        f"=== macOS Deep Storage Report — {ts} ===",
+        f"Roots: {', '.join(args.roots)}",
+        f"Depth: {args.depth} | Leaf-only: {args.leaf_only} | MinGB: {args.min_gb} | Top: {args.top}",
+    ]
+    if args.files:
+        lines.append(f"Files: enabled | MinFileGB: {args.min_file_gb}")
+    lines.append("")
 
-    report.close()
-    console.print(table)
-    console.print(f"\n✅ Full report saved to: [green]{REPORT_PATH}[/green]\n")
+    # Progress bar for roots
+    for root in track(args.roots, description="🔍 Scanning directories..."):
+        lines.append(f"\n### Root: {root}")
+        pairs = du_list(root, args.depth)
+        pairs = [p for p in pairs if human_gb(p[0]) >= args.min_gb]
+        if args.leaf_only:
+            pairs = leaf_only(pairs)
+        pairs = sorted(pairs, key=lambda x: x[0], reverse=True)[:args.top]
 
-    console.print(
-        "💡 [italic]Tip: Empty Trash and reboot after deleting large caches or updates.[/italic]"
-    )
+        if not pairs:
+            lines.append("  (no folders above threshold)")
+        else:
+            lines.append("  Top folders:")
+            for size_bytes, path in pairs:
+                lines.append(f"    {human_gb(size_bytes):6.2f}G\t{path}")
+
+        if args.files:
+            big_files = find_big_files(root, args.min_file_gb, args.top)
+            if big_files:
+                lines.append("  Top files:")
+                for size_bytes, path in big_files:
+                    lines.append(f"    {human_gb(size_bytes):6.2f}G\t{path}")
+            else:
+                lines.append("  (no files above threshold)")
+
+    report_path.write_text("\n".join(lines))
+    console.print(f"\n✅ Deep report saved to: [green]{report_path}[/green]")
+    console.print("💡 Tip: add --leaf-only to hide parent rows and --files to show large files.\n")
 
 
-# === RUNTIME ENTRY ===
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        console.print("\n[red]Cancelled by user.[/red]")
-        sys.exit(1)
+    main()
